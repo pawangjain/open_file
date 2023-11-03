@@ -1,20 +1,20 @@
 package com.crazecoder.openfile;
 
 import android.Manifest;
-import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.content.ActivityNotFoundException;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
 import android.net.Uri;
 import android.os.Build;
-import android.provider.Settings;
+import android.os.Environment;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.annotation.RequiresApi;
 import androidx.core.content.FileProvider;
-import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 import androidx.core.content.PermissionChecker;
 
@@ -32,6 +32,7 @@ import io.flutter.plugin.common.PluginRegistry;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.List;
 import java.util.Map;
 
 
@@ -40,9 +41,7 @@ import java.util.Map;
  */
 public class OpenFilePlugin implements MethodCallHandler
         , FlutterPlugin
-        , ActivityAware
-        , PluginRegistry.RequestPermissionsResultListener
-        , PluginRegistry.ActivityResultListener {
+        , ActivityAware {
     /**
      * Plugin registration.
      */
@@ -56,59 +55,67 @@ public class OpenFilePlugin implements MethodCallHandler
 
     private Result result;
     private String filePath;
-    private String typeString;
+    private String mimeType;
 
     private boolean isResultSubmitted = false;
 
-    private static final int REQUEST_CODE = 33432;
-    private static final int RESULT_CODE = 0x12;
     private static final String TYPE_STRING_APK = "application/vnd.android.package-archive";
 
-    @Deprecated
-    public static void registerWith(PluginRegistry.Registrar registrar) {
-        OpenFilePlugin plugin = new OpenFilePlugin();
-        plugin.activity = registrar.activity();
-        plugin.context = registrar.context();
-        plugin.channel = new MethodChannel(registrar.messenger(), "open_file");
-        plugin.channel.setMethodCallHandler(plugin);
-        registrar.addRequestPermissionsResultListener(plugin);
-        registrar.addActivityResultListener(plugin);
-    }
-
-    private boolean hasPermission(String permission) {
-        return ContextCompat.checkSelfPermission(activity, permission) == PermissionChecker.PERMISSION_GRANTED;
-    }
-
     @Override
-    @SuppressLint("NewApi")
     public void onMethodCall(MethodCall call, @NonNull Result result) {
         isResultSubmitted = false;
         if (call.method.equals("open_file")) {
-            filePath = call.argument("file_path");
             this.result = result;
-
+            filePath = call.argument("file_path");
             if (call.hasArgument("type") && call.argument("type") != null) {
-                typeString = call.argument("type");
+                mimeType = call.argument("type");
             } else {
-                typeString = getFileType(filePath);
+                mimeType = getFileMimeType(filePath);
+            }
+            if (!isFileAvailable()) {
+                return;
             }
             if (pathRequiresPermission()) {
-                if (hasPermission(Manifest.permission.READ_EXTERNAL_STORAGE)) {
-                    if (TYPE_STRING_APK.equals(typeString)) {
-                        openApkFile();
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && isExternalStoragePublicMedia(mimeType)) {
+                        if (isImage(mimeType) && !hasPermission(Manifest.permission.READ_MEDIA_IMAGES)) {
+                            result(-3, "Permission denied: " + Manifest.permission.READ_MEDIA_IMAGES);
+                            return;
+                        }
+                        if (isVideo(mimeType) && !hasPermission(Manifest.permission.READ_MEDIA_VIDEO)) {
+                            result(-3, "Permission denied: " + Manifest.permission.READ_MEDIA_VIDEO);
+                            return;
+                        }
+                        if (isAudio(mimeType) && !hasPermission(Manifest.permission.READ_MEDIA_AUDIO)) {
+                            result(-3, "Permission denied: " + Manifest.permission.READ_MEDIA_AUDIO);
+                            return;
+                        }
+                    } else if (!Environment.isExternalStorageManager()) {
+                        result(-3, "Permission denied: " + Manifest.permission.MANAGE_EXTERNAL_STORAGE);
                         return;
                     }
-                    startActivity();
-                } else {
-                    ActivityCompat.requestPermissions(activity, new String[]{Manifest.permission.READ_EXTERNAL_STORAGE}, REQUEST_CODE);
+                } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    if (!hasPermission(Manifest.permission.READ_EXTERNAL_STORAGE)) {
+                        result(-3, "Permission denied: " + Manifest.permission.READ_EXTERNAL_STORAGE);
+                        return;
+                    }
+
                 }
-            } else {
-                startActivity();
             }
+            if (TYPE_STRING_APK.equals(mimeType)) {
+                openApkFile();
+                return;
+            }
+            startActivity();
         } else {
             result.notImplemented();
             isResultSubmitted = true;
         }
+    }
+
+
+    private boolean hasPermission(String permission) {
+        return ContextCompat.checkSelfPermission(activity, permission) == PermissionChecker.PERMISSION_GRANTED;
     }
 
     private boolean pathRequiresPermission() {
@@ -117,40 +124,64 @@ public class OpenFilePlugin implements MethodCallHandler
         }
 
         try {
-            String appDirCanonicalPath = new File(context.getApplicationInfo().dataDir).getCanonicalPath();
+            String appDirExternalFilePath = context.getExternalFilesDir(null).getCanonicalPath();
+            String appDirExternalCachePath = context.getExternalCacheDir().getCanonicalPath();
+
+            String appDirFilePath = context.getFilesDir().getCanonicalPath();
+            String appDirCachePath = context.getCacheDir().getCanonicalPath();
+
             String fileCanonicalPath = new File(filePath).getCanonicalPath();
-            return !fileCanonicalPath.startsWith(appDirCanonicalPath);
+            if (fileCanonicalPath.startsWith(appDirExternalFilePath)
+                    || fileCanonicalPath.startsWith(appDirExternalCachePath)
+                    || fileCanonicalPath.startsWith(appDirFilePath)
+                    || fileCanonicalPath.startsWith(appDirCachePath)) {
+                return false;
+            } else {
+                return true;
+            }
         } catch (IOException e) {
             e.printStackTrace();
             return true;
         }
     }
 
-
-    private void startActivity() {
+    private boolean isFileAvailable() {
         if (filePath == null) {
             result(-4, "the file path cannot be null");
-            return;
+            return false;
         }
+
         File file = new File(filePath);
         if (!file.exists()) {
             result(-2, "the " + filePath + " file does not exists");
+            return false;
+        }
+        return true;
+    }
+
+    private void startActivity() {
+        if (!isFileAvailable()) {
             return;
         }
-
         Intent intent = new Intent(Intent.ACTION_VIEW);
-        if (TYPE_STRING_APK.equals(typeString))
-            intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        else
-            intent.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP);
-        intent.addCategory("android.intent.category.DEFAULT");
+        intent.addCategory(Intent.CATEGORY_DEFAULT);
+        Uri uri;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-            String packageName = context.getPackageName();
-            Uri uri = FileProvider.getUriForFile(context, packageName + ".fileProvider.com.crazecoder.openfile", new File(filePath));
-            intent.setDataAndType(uri, typeString);
+            uri = FileProvider.getUriForFile(context, context.getPackageName() + ".fileProvider.com.crazecoder.openfile", new File(filePath));
         } else {
-            intent.setDataAndType(Uri.fromFile(file), typeString);
+            uri = Uri.fromFile(new File(filePath));
+        }
+        intent.setDataAndType(uri, mimeType);
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        List<ResolveInfo> resolveInfoList;
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+            resolveInfoList = activity.getPackageManager().queryIntentActivities(intent, PackageManager.ResolveInfoFlags.of(PackageManager.MATCH_DEFAULT_ONLY));
+        }else{
+            resolveInfoList = activity.getPackageManager().queryIntentActivities(intent, PackageManager.MATCH_DEFAULT_ONLY);
+        }
+        for (ResolveInfo resolveInfo : resolveInfoList) {
+            String packageName = resolveInfo.activityInfo.packageName;
+            activity.grantUriPermission(packageName, uri, Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
         }
         int type = 0;
         String message = "done";
@@ -166,8 +197,51 @@ public class OpenFilePlugin implements MethodCallHandler
         result(type, message);
     }
 
+    @RequiresApi(api = Build.VERSION_CODES.S)
+    private boolean isExternalStoragePublicMedia(String mimeType) {
+        return isExternalStoragePublicPath() && (isImage(mimeType) || isVideo(mimeType) || isAudio(mimeType));
+    }
 
-    private String getFileType(String filePath) {
+    private boolean isImage(String mimeType) {
+        return mimeType.contains("image/");
+    }
+
+    private boolean isVideo(String mimeType) {
+        return mimeType.contains("video/");
+    }
+
+    private boolean isAudio(String mimeType) {
+        return mimeType.contains("audio/");
+    }
+
+    @RequiresApi(api = Build.VERSION_CODES.S)
+    private boolean isExternalStoragePublicPath() {
+        boolean isExternalStoragePublicPath = false;
+        String[] mediaStorePath = {
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES).getPath()
+                , Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS).getPath()
+                , Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).getPath()
+                , Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES).getPath()
+                , Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_ALARMS).getPath()
+                , Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_AUDIOBOOKS).getPath()
+                , Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM).getPath()
+                , Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC).getPath()
+                , Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_NOTIFICATIONS).getPath()
+                , Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PODCASTS).getPath()
+                , Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_RECORDINGS).getPath()
+                , Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_RINGTONES).getPath()
+                , Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_SCREENSHOTS).getPath()
+        };
+        for (String s : mediaStorePath) {
+            if (filePath.contains(s)) {
+                isExternalStoragePublicPath = true;
+                break;
+            }
+        }
+        return isExternalStoragePublicPath;
+    }
+
+    private String getFileMimeType(String filePath) {
         String[] fileStrs = filePath.split("\\.");
         String fileTypeStr = fileStrs[fileStrs.length - 1].toLowerCase();
         switch (fileTypeStr) {
@@ -311,69 +385,17 @@ public class OpenFilePlugin implements MethodCallHandler
         }
     }
 
-    @RequiresApi(api = Build.VERSION_CODES.M)
     private void openApkFile() {
-        if (!canInstallApk()) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startInstallPermissionSettingActivity();
-            } else {
-                ActivityCompat.requestPermissions(activity,
-                        new String[]{Manifest.permission.REQUEST_INSTALL_PACKAGES}, REQUEST_CODE);
-            }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !canInstallApk()) {
+            result(-3, "Permission denied: " + Manifest.permission.REQUEST_INSTALL_PACKAGES);
         } else {
             startActivity();
         }
     }
 
-    @RequiresApi(api = Build.VERSION_CODES.M)
-    private boolean canInstallApk() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            return activity.getPackageManager().canRequestPackageInstalls();
-        }
-        return hasPermission(Manifest.permission.REQUEST_INSTALL_PACKAGES);
-    }
-
     @RequiresApi(api = Build.VERSION_CODES.O)
-    private void startInstallPermissionSettingActivity() {
-        if (activity == null) {
-            return;
-        }
-        Uri packageURI = Uri.parse("package:" + activity.getPackageName());
-        Intent intent = new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, packageURI);
-        activity.startActivityForResult(intent, RESULT_CODE);
-    }
-
-    @RequiresApi(api = Build.VERSION_CODES.M)
-    @Override
-    public boolean onRequestPermissionsResult(int requestCode, String[] strings, int[] grantResults) {
-        if (requestCode != REQUEST_CODE) return false;
-        if (hasPermission(Manifest.permission.READ_EXTERNAL_STORAGE)
-                && TYPE_STRING_APK.equals(typeString)) {
-            openApkFile();
-            return false;
-        }
-        for (String string : strings) {
-            if (!hasPermission(string)) {
-                result(-3, "Permission denied: " + string);
-                return false;
-            }
-        }
-        startActivity();
-        return true;
-    }
-
-    @RequiresApi(api = Build.VERSION_CODES.M)
-    @Override
-    public boolean onActivityResult(int requestCode, int resultCode, Intent intent) {
-        if (requestCode == RESULT_CODE) {
-            if (canInstallApk()) {
-                startActivity();
-//                result(0, "done");
-            } else {
-                result(-3, "Permission denied: " + Manifest.permission.REQUEST_INSTALL_PACKAGES);
-            }
-        }
-        return false;
+    private boolean canInstallApk() {
+        return activity.getPackageManager().canRequestPackageInstalls();
     }
 
     private void result(int type, String message) {
@@ -391,6 +413,14 @@ public class OpenFilePlugin implements MethodCallHandler
 
     @Override
     public void onDetachedFromEngine(@NonNull FlutterPluginBinding binding) {
+        if (channel == null) {
+            // Could be on too low of an SDK to have started listening originally.
+            return;
+        }
+
+        channel.setMethodCallHandler(null);
+        channel = null;
+        this.flutterPluginBinding = null;
     }
 
     @Override
@@ -401,8 +431,6 @@ public class OpenFilePlugin implements MethodCallHandler
         context = flutterPluginBinding.getApplicationContext();
         activity = binding.getActivity();
         channel.setMethodCallHandler(this);
-        binding.addRequestPermissionsResultListener(this);
-        binding.addActivityResultListener(this);
     }
 
     @Override
@@ -417,13 +445,6 @@ public class OpenFilePlugin implements MethodCallHandler
 
     @Override
     public void onDetachedFromActivity() {
-        if (channel == null) {
-            // Could be on too low of an SDK to have started listening originally.
-            return;
-        }
 
-        channel.setMethodCallHandler(null);
-        channel = null;
-        this.flutterPluginBinding = null;
     }
 }
